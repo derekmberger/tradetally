@@ -6872,7 +6872,16 @@ async function parseThinkorswimTransactions(records, existingPositions = {}, con
     const symbol = firstTx.symbol;
     const instrumentData = firstTx.instrumentData || { instrumentType: 'stock' };
     const isOption = instrumentData.instrumentType === 'option';
-    const valueMultiplier = isOption ? 100 : 1;
+    const isFuture = instrumentData.instrumentType === 'future';
+    // Per-instrument dollar multiplier applied to entryValue/exitValue when
+    // computing P&L. For futures, this is the contract pointValue (e.g. $50
+    // for ES, $5 for MES) — without it, single-trade futures P&L comes out
+    // off by the multiplier factor. (applyTradeGrouping further down ALREADY
+    // handles this for grouped trades via the same pointValue lookup; this
+    // local block was missing the symmetric handling for single trades.)
+    const valueMultiplier = isOption
+      ? 100
+      : (isFuture ? (instrumentData.pointValue || 1) : 1);
 
     console.log(`\n=== Processing ${symbolTransactions.length} transactions for ${groupKey} ===`);
 
