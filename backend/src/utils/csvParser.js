@@ -6661,32 +6661,71 @@ async function parseThinkorswimTransactions(records, existingPositions = {}, con
         continue;
       }
 
-      // Detect options: "CRM 100 (Weeklys) 2 APR 26 175 PUT" or "CRM 100 2 APR 26 175 CALL"
-      // Pattern: UNDERLYING MULTIPLIER [optional (series)] DAY MONTH YEAR STRIKE PUT/CALL
       let symbol;
       let instrumentData = { instrumentType: 'stock' };
-      const optionMatch = symbolPart.match(/^(\S+)\s+\d+\s+(?:\(.*?\)\s+)?(\d{1,2})\s+([A-Z]{3})\s+(\d{2,4})\s+([\d.]+)\s+(PUT|CALL)$/i);
-      if (optionMatch) {
-        const [, underlying, day, monthStr, yearStr, strike, optType] = optionMatch;
-        const months = {
-          'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
-          'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
-        };
-        const month = months[monthStr.toUpperCase()];
-        const fullYear = yearStr.length === 2 ? 2000 + parseInt(yearStr) : parseInt(yearStr);
-        symbol = underlying;
+
+      // Detect futures: ToS/Schwab format is `/SYMBOL:EXCHANGE`, e.g., `/ESM26:XCME`,
+      // `/MESM26:XCME`, `/ZNM26:XCBT`. Decompose into [underlying][monthCode][year].
+      // Without this branch the parser falls through to "stock", setting multiplier=1,
+      // which makes P&L 50x off for ES, 5x off for MES, etc.
+      //
+      // Field names + metadata match the TradingView (csvParser.js:1072) and IBKR
+      // (parseIBKR…) importers so downstream analytics/dashboards/broker-sync see a
+      // consistent shape regardless of source. Trade.calculatePnL (Trade.js:1807)
+      // uses `pointValue` for futures math.
+      const futuresMatch = symbolPart.match(/^\/([A-Z]{1,4})([FGHJKMNQUVXZ])(\d{1,2})(?::[A-Z]+)?$/);
+      if (futuresMatch) {
+        const [, underlying, monthCode, yearStr] = futuresMatch;
+        const futuresContract = `${underlying}${monthCode}${yearStr}`;
+        const monthMap = { F:'01', G:'02', H:'03', J:'04', K:'05', M:'06', N:'07', Q:'08', U:'09', V:'10', X:'11', Z:'12' };
+        let year = parseInt(yearStr, 10);
+        // Single-digit year (e.g., M5) → assume current decade; two-digit → assume 2000s
+        if (year < 10) year += Math.floor(new Date().getFullYear() / 10) * 10;
+        else if (year < 100) year += 2000;
+        const pointValue = getFuturesPointValue(underlying);
+        // getFuturesPointValue silently returns $50 for unknown underlyings — warn so
+        // the operator notices when trading something outside the known table.
+        const KNOWN_UNDERLYINGS = new Set(['ES','NQ','YM','RTY','MES','MNQ','MYM','M2K','CL','MCL','NG','MNG','QG','GC','MGC','SI','SIL','HG','ZB','ZN','ZF','ZT']);
+        if (!KNOWN_UNDERLYINGS.has(underlying)) {
+          console.warn(`[TOS] Unknown futures underlying '${underlying}' — defaulting to $${pointValue}/pt. Verify P&L; add to futuresUtils.js point-value table if wrong.`);
+        }
+        symbol = futuresContract;
         instrumentData = {
-          instrumentType: 'option',
-          underlyingSymbol: underlying,
-          strikePrice: parseFloat(strike),
-          expirationDate: `${fullYear}-${month}-${day.padStart(2, '0')}`,
-          optionType: optType.toLowerCase(),
-          contractSize: 100
+          instrumentType: 'future',
+          underlyingAsset: underlying,
+          contractMonth: monthMap[monthCode] || null,
+          contractYear: year || null,
+          contractSize: null,
+          pointValue,
+          tickSize: null,
         };
-        console.log(`[TOS] Detected option: ${underlying} ${strike} ${optType} exp ${instrumentData.expirationDate}`);
+        console.log(`[TOS] Detected futures: ${futuresContract} (underlying=${underlying}, ${monthCode}${yearStr}, pointValue=$${pointValue})`);
       } else {
-        // Stock - symbolPart is just the ticker
-        symbol = symbolPart.trim();
+        // Detect options: "CRM 100 (Weeklys) 2 APR 26 175 PUT" or "CRM 100 2 APR 26 175 CALL"
+        // Pattern: UNDERLYING MULTIPLIER [optional (series)] DAY MONTH YEAR STRIKE PUT/CALL
+        const optionMatch = symbolPart.match(/^(\S+)\s+\d+\s+(?:\(.*?\)\s+)?(\d{1,2})\s+([A-Z]{3})\s+(\d{2,4})\s+([\d.]+)\s+(PUT|CALL)$/i);
+        if (optionMatch) {
+          const [, underlying, day, monthStr, yearStr, strike, optType] = optionMatch;
+          const months = {
+            'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
+            'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
+          };
+          const month = months[monthStr.toUpperCase()];
+          const fullYear = yearStr.length === 2 ? 2000 + parseInt(yearStr) : parseInt(yearStr);
+          symbol = underlying;
+          instrumentData = {
+            instrumentType: 'option',
+            underlyingSymbol: underlying,
+            strikePrice: parseFloat(strike),
+            expirationDate: `${fullYear}-${month}-${day.padStart(2, '0')}`,
+            optionType: optType.toLowerCase(),
+            contractSize: 100
+          };
+          console.log(`[TOS] Detected option: ${underlying} ${strike} ${optType} exp ${instrumentData.expirationDate}`);
+        } else {
+          // Stock - symbolPart is just the ticker
+          symbol = symbolPart.trim();
+        }
       }
 
       // Defense-in-depth: the trades table caps symbol at varchar(30). If anything
@@ -6704,9 +6743,12 @@ async function parseThinkorswimTransactions(records, existingPositions = {}, con
         continue;
       }
 
-      // Parse fees
-      const miscFees = parseFloat((record['Misc Fees'] || '0').replace(/[$,]/g, '')) || 0;
-      const commissionsFees = parseFloat((record['Commissions & Fees'] || '0').replace(/[$,]/g, '')) || 0;
+      // Parse fees — Schwab/ToS exports fees as NEGATIVE numbers (money debited).
+      // Other brokers export as POSITIVE. Downstream P&L math does `Net = Gross - fees`,
+      // which assumes positive. Without Math.abs() here, Schwab-negative fees flip the
+      // sign and make Net > Gross (user observed +$27.30 net on a $20 gross trade).
+      const miscFees = Math.abs(parseFloat((record['Misc Fees'] || '0').replace(/[$,]/g, '')) || 0);
+      const commissionsFees = Math.abs(parseFloat((record['Commissions & Fees'] || '0').replace(/[$,]/g, '')) || 0);
       const totalFees = miscFees + commissionsFees;
 
       // Determine account identifier - user selection takes priority over CSV column
