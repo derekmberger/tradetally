@@ -676,6 +676,174 @@ function extractIBKRActivityStatementSection(csvString) {
   return { section, csv, dataRows: collectedRows.length };
 }
 
+/**
+ * Extract TRD rows from a modern Schwab/ToS multi-section Account Statement.
+ *
+ * The format (post-Schwab-ToS-merger) is a single CSV with up to 9 named
+ * sections: Cash Balance, Futures Statements, Forex Statements, Crypto
+ * Statements, Account Order History, Account Trade History, Equities,
+ * Profits and Losses, Account Summary. Each section has its own header
+ * row + column layout. The traditional single-section ThinkorSwim
+ * importer can't read this directly because csv-parse keys all rows by
+ * the FIRST header it sees (Cash Balance's columns).
+ *
+ * This function walks the buffer line-by-line, tracks the current
+ * section, and for the two ELIGIBLE sections (Cash Balance + Futures
+ * Statements) extracts TRD rows. Per-section column-name differences
+ * are normalized to the canonical shape that parseThinkorswimTransactions
+ * already expects:
+ *   { DATE, TIME, TYPE, "REF #", DESCRIPTION,
+ *     "Commissions & Fees", "Misc Fees" }
+ *
+ * Other transformations applied to each row:
+ *   - Strip Excel-format wrappers (`="..."`) on REF #
+ *   - Replace `--` placeholders with empty strings in fee fields
+ *
+ * Forex / Crypto / Equities / Profits / etc. sections are silently
+ * skipped — they don't contain TRD rows in any test data we've seen yet
+ * (Equities is a positions snapshot, not trades; Forex + Crypto are
+ * empty in the operator's statement). Adding them is a follow-up when
+ * we have real broker data with non-empty Forex/Crypto sections.
+ *
+ * Returns: array of normalized record objects. Empty if no TRD rows.
+ */
+function extractSchwabMultiSectionRecords(fileBuffer) {
+  const text = fileBuffer.toString('utf8').replace(/^﻿/, ''); // strip BOM
+  const lines = text.split(/\r?\n/);
+
+  // v1 scope: only Cash Balance + Futures Statements. See docstring.
+  const ELIGIBLE_SECTIONS = new Set(['Cash Balance', 'Futures Statements']);
+  const records = [];
+
+  let currentSection = null;
+  let currentHeader = null;
+  let currentColMap = null;
+
+  // Per-section column-name mapping. Values are the column name in that
+  // section that maps to the canonical name. Index resolution happens at
+  // runtime via currentHeader.indexOf(). Verified against the canonical
+  // raw file.
+  const COLUMN_ALIASES = {
+    'Cash Balance': {
+      DATE: 'DATE',
+      TIME: 'TIME',
+      TYPE: 'TYPE',
+      'REF #': 'REF #',
+      DESCRIPTION: 'DESCRIPTION',
+      'Commissions & Fees': 'Commissions & Fees',
+      'Misc Fees': 'Misc Fees',
+    },
+    'Futures Statements': {
+      DATE: 'Trade Date',
+      TIME: 'Exec Time',
+      TYPE: 'Type',
+      'REF #': 'Ref #',
+      DESCRIPTION: 'Description',
+      'Commissions & Fees': 'Commissions & Fees',
+      'Misc Fees': 'Misc Fees',
+    },
+    // FUTURE: 'Forex Statements' header is `,Date,Time,Type,Ref #,Description,Commissions & Fees,Amount,Amount(USD),Balance`
+    //         (10 cols, leading empty field, `Date`/`Time` not Trade/Exec, includes `Amount(USD)`).
+    // FUTURE: Crypto section is `"Crypto # (Crypto offered by Charles Schwab Premier Bank, SSB) Statements"` (quoted marker).
+    //         Header: `Trade Date,Exec Date,Exec Time,Type,Ref #,Description,Commissions & Fees,Amount,Balance` (9 cols, no Misc Fees).
+    //         Both skipped in v1 — empty in canonical test file, can't verify column maps without real trades.
+  };
+
+  // Naive CSV row parser — handles quoted fields with embedded commas +
+  // escaped quotes. csv-parse can't be re-pointed mid-stream so we DIY here.
+  function parseRow(line) {
+    const out = [];
+    let cur = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (inQuotes) {
+        if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+        else if (c === '"') { inQuotes = false; }
+        else { cur += c; }
+      } else {
+        if (c === ',') { out.push(cur); cur = ''; }
+        else if (c === '"') { inQuotes = true; }
+        else { cur += c; }
+      }
+    }
+    out.push(cur);
+    return out;
+  }
+
+  const stripExcelRef = (v) => (v.startsWith('="') && v.endsWith('"') ? v.slice(2, -1) : v);
+  const cleanFee = (v) => (v.trim() === '--' ? '' : v.trim());
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const raw = lines[lineIdx];
+    if (!raw.trim()) {
+      // Empty line ends current section context
+      currentSection = null;
+      currentHeader = null;
+      currentColMap = null;
+      continue;
+    }
+
+    const fields = parseRow(raw);
+
+    // Section name = a row with a non-empty first field and all-empty rest.
+    // (Crypto's marker is quoted because of parens in name — parseRow handles
+    // that and unquotes it, leaving a single-field row.)
+    const isSectionMarker = fields[0].trim() !== '' && fields.slice(1).every((f) => f.trim() === '');
+    if (isSectionMarker) {
+      const name = fields[0].trim();
+      currentSection = ELIGIBLE_SECTIONS.has(name) ? name : null;
+      currentHeader = null;
+      currentColMap = null;
+      continue;
+    }
+
+    if (!currentSection) continue;
+
+    // First row inside an eligible section is its header
+    if (!currentHeader) {
+      currentHeader = fields.map((f) => f.trim());
+      const alias = COLUMN_ALIASES[currentSection];
+      currentColMap = {};
+      for (const [canonical, sectionCol] of Object.entries(alias)) {
+        if (!sectionCol) { currentColMap[canonical] = -1; continue; }
+        currentColMap[canonical] = currentHeader.indexOf(sectionCol);
+      }
+      // Sanity: must have at least TYPE + DESCRIPTION to be useful
+      if (currentColMap.TYPE < 0 || currentColMap.DESCRIPTION < 0) {
+        console.warn(`[SchwabMultiSection] Section "${currentSection}" missing required columns; skipping`);
+        currentSection = null;
+        currentHeader = null;
+        currentColMap = null;
+      }
+      continue;
+    }
+
+    // Data row: filter to TRD
+    const typeIdx = currentColMap.TYPE;
+    if (typeIdx < 0 || typeIdx >= fields.length) continue;
+    if (fields[typeIdx].trim().toUpperCase() !== 'TRD') continue;
+
+    const get = (canonical) => {
+      const i = currentColMap[canonical];
+      if (i < 0 || i >= fields.length) return '';
+      return fields[i];
+    };
+
+    records.push({
+      DATE: get('DATE').trim(),
+      TIME: get('TIME').trim(),
+      TYPE: 'TRD',
+      'REF #': stripExcelRef(get('REF #').trim()),
+      DESCRIPTION: get('DESCRIPTION').trim(),
+      'Commissions & Fees': cleanFee(get('Commissions & Fees')),
+      'Misc Fees': cleanFee(get('Misc Fees')),
+    });
+  }
+
+  return records;
+}
+
 function detectBrokerFormat(fileBuffer) {
   try {
     let csvString = fileBuffer.toString('utf-8');
@@ -11450,5 +11618,6 @@ module.exports = {
   applyTradeGrouping,
   isValidTrade,
   parseInstrumentData,
-  normalizeRecord
+  normalizeRecord,
+  extractSchwabMultiSectionRecords,
 };
