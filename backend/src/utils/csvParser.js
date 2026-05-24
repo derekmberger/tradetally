@@ -912,6 +912,26 @@ function detectBrokerFormat(fileBuffer) {
     const headers = headerLine.toLowerCase();
     console.log(`[AUTO-DETECT] Analyzing headers (line ${headerLineIndex + 1}): ${headerLine.substring(0, 200)}...`);
 
+    // Detect modern Schwab/ToS multi-section "Account Statement" — has a top-of-file
+    // header like `Account Statement for <acctnum>...` followed by named sections
+    // (Cash Balance, Futures Statements, etc.). Distinct from traditional single-section
+    // ThinkorSwim exports because csv-parse can't read these directly (each section
+    // has its own header row + column layout). Detection runs BEFORE the existing ToS
+    // header-pattern check because multi-section files contain a `DATE,TIME,TYPE,REF #,
+    // DESCRIPTION` header line inside their Cash Balance section that would otherwise
+    // trigger the single-section ToS path.
+    //
+    // Why only the first 4KB: the header + first one or two section markers all live
+    // in the first ~20 lines. Account Trade History and later sections start beyond
+    // 4KB, so scanning further is wasted work.
+    const bufferText4kb = fileBuffer.toString('utf8').substring(0, 4096);
+    const hasAccountStatementHeader = /^[﻿]?Account Statement for /m.test(bufferText4kb);
+    const hasAnyKnownSection = /^(Cash Balance|Futures Statements|Forex Statements|Account Summary)$/m.test(bufferText4kb);
+    if (hasAccountStatementHeader && hasAnyKnownSection) {
+      console.log('[AUTO-DETECT] Detected: ThinkorSwim (Schwab multi-section Account Statement)');
+      return 'thinkorswim-schwab-multisection';
+    }
+
     // ThinkorSwim detection - look for DATE, TIME, TYPE, REF #, DESCRIPTION pattern
     if (headers.includes('date') && headers.includes('time') && headers.includes('type') &&
         headers.includes('ref #') && headers.includes('description')) {
