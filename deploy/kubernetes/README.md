@@ -1,30 +1,25 @@
 # Kubernetes deployment
 
 Production-style Kubernetes manifests for self-hosting TradeTally on any
-k8s cluster (tested on Talos Linux 1.13 / Kubernetes 1.36, but nothing here
-is distro-specific).
-
-This deployment was originally built for a homelab and copied here for
-reuse. The full operator runbook is in [`RUNBOOK.md`](RUNBOOK.md).
+k8s cluster.
 
 ## What you get
 
-Single-replica deployment with a sidecar Postgres StatefulSet:
-
 ```
 tradetally namespace (PSA: baseline)
-├── Postgres 16.14-alpine StatefulSet (1 replica, 10Gi local-path PVC)
+├── Postgres 16.14-alpine StatefulSet (1 replica, 10Gi PVC)
 │   └── Headless Service for stable DNS (tradetally-db:5432)
 └── Tradetally app Deployment (1 replica, Recreate strategy)
     ├── Uploads PVC (5Gi, RWO)
-    ├── ConfigMap (~40 env vars, non-sensitive)
-    ├── Secret 1: env vars (DB password, JWT, API keys)
-    ├── Secret 2: OAuth2 RSA keypair (file-mounted)
+    ├── ConfigMap (non-sensitive env vars)
+    ├── Secret: env vars (DB password, JWT, API keys)
+    ├── Secret: OAuth2 RSA keypair (file-mounted)
     ├── ClusterIP Service (port 80)
-    └── Ingress (TLS via cert-manager, body/timeout annotations tuned for the in-image nginx)
+    └── Ingress (TLS via cert-manager, body/timeout annotations tuned for
+        the in-image nginx)
 ```
 
-Why single-replica:
+Why single-replica + Recreate:
 - The app runs ~14 in-process schedulers (price monitor, gamification,
   earnings, news, etc.) — two replicas would duplicate-fire every job.
 - The uploads PVC is RWO; `Recreate` strategy is forced by physics (two
@@ -34,23 +29,20 @@ Why single-replica:
 
 | Requirement | Why |
 |---|---|
-| Kubernetes 1.30+ | PSA baseline + recent ingress-nginx + standard APIs |
+| Kubernetes 1.30+ | PSA baseline + standard APIs |
 | An ingress controller (nginx-ingress, traefik, etc.) | Routes inbound HTTPS |
-| cert-manager OR pre-provisioned TLS | Real cert at `https://your-host.example.com/` |
-| A default StorageClass | PVCs (10Gi postgres + 5Gi uploads) |
+| cert-manager OR pre-provisioned TLS | Real cert at `https://<your-host>/` |
+| A default StorageClass | PVCs (10Gi postgres + 5Gi uploads). Default uses `local-path`; edit the PVC specs if your cluster uses a different class. |
 | `cluster-issuer` named `letsencrypt-prod` | Hardcoded in `app/ingress.yaml`; rename or change annotation if yours differs |
-
-If you don't run cert-manager, swap the `cert-manager.io/cluster-issuer`
-annotation in `app/ingress.yaml` for whatever your cluster provides.
 
 ## File layout
 
 ```
 deploy/kubernetes/
-├── 00-namespace.yaml                       # PSA baseline (needed: image's nginx master runs as root)
+├── 00-namespace.yaml                       # PSA baseline (image's nginx master runs as root)
 ├── tradetally-config.yaml                  # ConfigMap — non-sensitive env vars
-├── tradetally-secrets.example.yaml         # Secret template — generate real values, do NOT commit
-├── tradetally-oauth-keys.example.yaml      # Secret template — generate RSA keypair, do NOT commit
+├── tradetally-secrets.example.yaml         # Template for runtime secrets; do NOT commit real values
+├── tradetally-oauth-keys.example.yaml      # Template + instructions for OAuth2 RSA keypair
 ├── postgres/
 │   ├── postgresql-config.yaml              # Tuned conf (max_connections=200, shared_buffers=256MB, etc.)
 │   ├── service.yaml                        # Headless ClusterIP
@@ -60,98 +52,173 @@ deploy/kubernetes/
 │   ├── service.yaml                        # ClusterIP :80
 │   ├── ingress.yaml                        # TLS + 150m body / 600s timeout
 │   └── pvc-uploads.yaml                    # 5Gi RWO
-├── apply-tradetally.sh                     # Idempotent install/reapply script
-└── RUNBOOK.md                              # Full operator runbook
+└── apply-tradetally.sh                     # Idempotent install/reapply script
 ```
 
-## Quick start
+## Setup
+
+### 1. Pick your hostname
+
+Search-and-replace `tradetally.example.com` with your real hostname in:
+- `tradetally-config.yaml` (multiple fields: `INSTANCE_URL`, `APP_URL`,
+  `BASE_URL`, `FRONTEND_URL`, `WEBAUTHN_RP_ID`, `SCHWAB_REDIRECT_URI`)
+- `app/ingress.yaml` (`tls.hosts` and `rules.host`)
+
+### 2. Generate the runtime Secret
 
 ```bash
-# 1. Change the hostname in tradetally-config.yaml + app/ingress.yaml from
-#    `tradetally.example.com` to your real hostname.
-#    Also: WEBAUTHN_RP_ID and SCHWAB_REDIRECT_URI in the ConfigMap.
-
-# 2. Generate the secrets.
 cp tradetally-secrets.example.yaml tradetally-secrets.yaml
-# Edit tradetally-secrets.yaml — fill in DB_PASSWORD, JWT_SECRET, BROKER_ENCRYPTION_KEY:
-DB_PASS=$(openssl rand -base64 32)
-JWT=$(openssl rand -base64 48)
-BROKER=$(openssl rand -hex 32)
-# (paste these into the file's stringData section)
+# Then edit tradetally-secrets.yaml — fill the three CHANGE_ME values:
+openssl rand -base64 32   # → DB_PASSWORD
+openssl rand -base64 48   # → JWT_SECRET
+openssl rand -hex 32      # → BROKER_ENCRYPTION_KEY
+```
 
-# 3. Generate the OAuth keypair.
+Leave the rest as empty strings until you have the corresponding API key
+(Finnhub, Gemini, Stripe, etc.) — empty-string is treated as unset by the
+backend's env validator.
+
+**Do not commit `tradetally-secrets.yaml` with real values.** If you need
+version-controlled secrets, encrypt with SOPS / sealed-secrets /
+external-secrets-operator before commit.
+
+### 3. Generate the OAuth2 keypair
+
+The mobile app's OAuth2/OIDC flow needs an RSA signing keypair. Generate
+locally + create the Secret directly with kubectl:
+
+```bash
 openssl genrsa -out /tmp/oauth-private.pem 2048
 openssl rsa -in /tmp/oauth-private.pem -pubout -out /tmp/oauth-public.pem
+
 kubectl create namespace tradetally --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret generic tradetally-oauth-keys -n tradetally \
   --from-file=oauth-private.pem=/tmp/oauth-private.pem \
-  --from-file=oauth-public.pem=/tmp/oauth-public.pem
-shred -u /tmp/oauth-private.pem /tmp/oauth-public.pem 2>/dev/null || rm /tmp/oauth-private.pem /tmp/oauth-public.pem
+  --from-file=oauth-public.pem=/tmp/oauth-public.pem \
+  --dry-run=client -o yaml > tradetally-oauth-keys.yaml
 
-# 4. Apply the rest.
-kubectl apply -f 00-namespace.yaml
-kubectl apply -f tradetally-secrets.yaml
-kubectl apply -f tradetally-config.yaml
-kubectl apply -f postgres/postgresql-config.yaml
-kubectl apply -f postgres/service.yaml
-kubectl apply -f postgres/statefulset.yaml
-kubectl rollout status statefulset/tradetally-db -n tradetally --timeout=180s
-kubectl apply -f app/pvc-uploads.yaml
-kubectl apply -f app/deployment.yaml
-kubectl apply -f app/service.yaml
-kubectl apply -f app/ingress.yaml
-kubectl rollout status deployment/tradetally-app -n tradetally --timeout=600s
+# Then either apply directly or encrypt before commit:
+kubectl apply -f tradetally-oauth-keys.yaml
 
-# 5. Open https://your-host.example.com/
+shred -u /tmp/oauth-private.pem /tmp/oauth-public.pem 2>/dev/null \
+  || rm /tmp/oauth-private.pem /tmp/oauth-public.pem
 ```
 
-Or just run `bash apply-tradetally.sh` — but read it first since it assumes
-your secrets are SOPS-encrypted at `tradetally-secrets.sops.yaml` and
-`tradetally-oauth-keys.sops.yaml`. If you're using plain Secrets or a
-different secret-management tool (sealed-secrets, external-secrets), edit
-the `sops -d ... | kubectl apply -f -` lines accordingly.
+### 4. Apply everything
 
-## Important operator notes
+```bash
+bash apply-tradetally.sh
+```
 
-These come up in real operation — see `RUNBOOK.md` for full detail.
+The script enforces the apply order (Postgres before app), waits for
+each rollout, and prints a summary. Idempotent — safe to re-run after
+edits.
 
-1. **First-boot is slow** (~3-5 min): 189 migrations run sequentially before
-   the backend binds to port 3000. The `startupProbe` has a 10-min budget;
-   don't tighten it.
-2. **Trade Grouping setting**: change in your User → Settings to ≤10 min
-   (default 60 min silently merges close-together same-side round-trips,
-   hiding losing legs from your trade history).
-3. **`/api/health` always returns 200**; `.status` reads `DEGRADED` when
-   `ENABLE_BACKUP_SCHEDULER=false`. This is expected. Monitor on the
-   `.services.database` and `.services.storage` fields instead.
-4. **WEBAUTHN_RP_ID is effectively write-once** — once any user registers
-   a passkey, changing the hostname invalidates every existing passkey.
-5. **`Recreate` deploy strategy** causes ~30-90s downtime on every upgrade.
-   RWO PVC physics forces this; you can't do rolling updates without first
-   moving uploads off-cluster (S3, B2, MinIO).
+If you'd rather drive it manually, the script body is short enough to
+read top-to-bottom and copy what you want.
 
-## Provenance / fork-specific patches
+### 5. Open your hostname
 
-This `deploy/kubernetes/` tree was built against the homelab `homelab-patches`
-branch of this fork. The image referenced in `app/deployment.yaml` is the
-upstream `potentialmidas/tradetally:v2.6.8`; if you want this fork's bug
-fixes (Schwab futures import + multi-section CSV parser), rebuild from
-this branch:
+`https://<your-host>/` should serve the app. First boot takes 3-5 minutes
+(see operating notes below).
+
+## Operating notes
+
+These come up in real operation; document for the next person.
+
+**First-boot is slow** (~3-5 min). 189 migrations run sequentially before
+the backend binds to port 3000. The `startupProbe` in `app/deployment.yaml`
+has a 10-min budget. Don't tighten without measuring.
+
+**Trade Grouping setting.** Default is 60 minutes — silently merges
+close-together same-side round-trips, which can hide losing legs from your
+trade history. Set it to ≤10 minutes under your user's Settings → Trading
+preferences to avoid this. (Partial fills, which fire in seconds, still
+group correctly.)
+
+**`/api/health` always returns HTTP 200**, even when `.status` is
+`DEGRADED`. The status field reads `DEGRADED` whenever
+`ENABLE_BACKUP_SCHEDULER=false` (which is the default in `tradetally-config.yaml`
+because no off-cluster backup destination is configured). Don't alert on
+`health.status`; alert on `health.services.database` and
+`health.services.storage` instead.
+
+**`WEBAUTHN_RP_ID` is effectively write-once.** Once any user registers a
+passkey, the credential is cryptographically bound to that exact hostname.
+Changing the hostname invalidates every existing passkey — browsers refuse
+to use them on a new RP ID. Plan a passkey-reset migration if you must
+change.
+
+**`Recreate` deploy strategy = ~30-90s downtime on every upgrade.** RWO PVC
+physics force this; rolling updates can't multi-attach. If you need zero
+downtime, the cleanest path is moving uploads to object storage (S3, B2,
+MinIO) — then `RollingUpdate` works because pods no longer share file
+storage.
+
+**Local-path PVCs (default StorageClass) pin pods to nodes.** If your
+cluster uses `local-path` provisioner, the Postgres + uploads PVCs anchor
+the pods to whichever node received the first scheduling. Node reboot
+means the pod is Pending until the node returns. For multi-node
+resilience, use a networked StorageClass (longhorn, ceph, etc.) instead.
+
+**Password reset is impossible without SMTP** by default. Email/SMTP
+secrets aren't populated by the example templates. With
+`REGISTRATION_MODE=closed` and only the operator account, account
+recovery is via direct `psql` access to the `users` table. Add the SMTP
+secrets in `tradetally-secrets.yaml` to enable in-app password reset.
+
+**`/api-docs` Swagger UI is enabled by default and reachable on whoever can
+hit the Ingress.** Acceptable on LAN-only; tighten via Ingress auth
+annotation if exposed publicly.
+
+## Upgrade procedure
+
+```bash
+# 1. Bump the image tag in app/deployment.yaml
+# 2. Re-apply
+bash apply-tradetally.sh
+```
+
+Brief downtime (~30-90s) per the Recreate strategy. New migrations (if
+any) run during the new pod's startup; the `startupProbe` covers this.
+
+## Postgres maintenance
+
+```bash
+# Connect
+kubectl -n tradetally exec -it tradetally-db-0 -- psql -U trader tradetally
+
+# Backup (manual pg_dump)
+kubectl -n tradetally exec tradetally-db-0 -- pg_dump -U trader tradetally \
+  > backup-$(date +%Y%m%d).sql
+
+# Restore (DESTRUCTIVE)
+kubectl -n tradetally exec -i tradetally-db-0 -- psql -U trader tradetally \
+  < backup-YYYYMMDD.sql
+
+# View slow queries (top 10 by total time)
+kubectl -n tradetally exec tradetally-db-0 -- psql -U trader tradetally -c \
+  "SELECT round(total_exec_time::numeric, 1) AS total_ms, calls,
+          round(mean_exec_time::numeric, 1) AS mean_ms, query
+   FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;"
+
+# Apply postgresql.conf changes — restart picks up the new ConfigMap value
+kubectl apply -f postgres/postgresql-config.yaml
+kubectl rollout restart statefulset/tradetally-db -n tradetally
+```
+
+## Provenance
+
+These manifests originated in a homelab Talos cluster deployment. The
+`homelab-patches` branch of this fork carries source-level fixes for
+Schwab futures imports + multi-section Account Statement parsing.
+
+If you want the patched behavior, rebuild from this branch:
 
 ```bash
 docker buildx build --platform linux/amd64 \
-  -t your.registry.example.com/tradetally:v2.6.8-patched \
+  -t your.registry.example.com/tradetally:<your-tag> \
   --push .
 ```
 
 Then update the `image:` line in `app/deployment.yaml`.
-
-What the fork branch fixes vs upstream `v2.6.8` (see commit history for details):
-
-| Patch | Fixes |
-|---|---|
-| Futures detection + fee sign normalization | ES P&L was 50× too small, MES 5× too small; Net came out > Gross because Schwab exports fees as negative |
-| Single-trade pointValue application | Grouped trades had correct math; single trades still defaulted to multiplier=1 |
-| Multi-section Schwab Account Statement parser | Raw Schwab "Account Statement" exports (Cash Balance + Futures Statements + ... sections) now parse natively without preprocessing |
-
-If/when these land upstream, the fork rebuild step goes away.

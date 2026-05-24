@@ -21,12 +21,10 @@ spec:
       # to be overwritten by start.sh seconds later (wasted IO).
       containers:
         - name: tradetally
-          # Replace with your image. If you're running the upstream image,
-          # `potentialmidas/tradetally:v2.6.8` works as-is. If you've patched
-          # the source (e.g., from this fork's `homelab-patches` branch),
-          # rebuild + push to your own registry, e.g.:
+          # If you've built from source (e.g. to incorporate local patches),
+          # rebuild + push to your own registry and update this image tag:
           #   docker buildx build --platform linux/amd64 \
-          #     -t your.registry.example.com/tradetally:v2.6.8-patched \
+          #     -t your.registry.example.com/tradetally:<your-tag> \
           #     --push .
           image: potentialmidas/tradetally:v2.6.8
           ports:
