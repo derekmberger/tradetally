@@ -140,3 +140,7 @@ CLAUDE.md
 AGENTS.md
 backend/.envy
 zap.yaml
+
+# Repo uses pnpm (per package.json packageManager: pnpm@10.13.1).
+# npm-style lock files are unwanted — they conflict with pnpm-lock.yaml.
+**/package-lock.json
