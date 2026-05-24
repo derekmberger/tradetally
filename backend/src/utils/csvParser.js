@@ -3436,7 +3436,20 @@ async function parseCSV(fileBuffer, broker = 'generic', context = {}) {
         throw parseError;
       }
     }
-    
+
+    // For modern Schwab multi-section Account Statement files, csv-parse just
+    // produced garbage records (it keys all rows by the first section's header).
+    // Replace `records` with what our buffer-aware pre-processor extracts, then
+    // alias the broker name so the existing `if (broker === 'thinkorswim')`
+    // dispatch handles the rest unchanged — futures detection + fee normalization
+    // already work (v2.6.8-homelab.1 + .2 patches).
+    if (broker === 'thinkorswim-schwab-multisection') {
+      console.log('[SchwabMultiSection] Pre-processing multi-section file before ThinkorSwim dispatch');
+      records = extractSchwabMultiSectionRecords(fileBuffer);
+      console.log(`[SchwabMultiSection] Extracted ${records.length} TRD rows`);
+      broker = 'thinkorswim';
+    }
+
     console.log(`Parsing ${records.length} records with ${broker} parser`);
 
     // Update diagnostics with row count and headers
