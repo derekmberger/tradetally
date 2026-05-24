@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tradetally-db
+  namespace: tradetally
+spec:
+  serviceName: tradetally-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tradetally-db
+  template:
+    metadata:
+      labels:
+        app: tradetally-db
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        fsGroup: 70                       # Alpine postgres GID (not 999 — Alpine convention)
+      containers:
+        - name: postgres
+          image: postgres:16.14-alpine3.23
+          # Use our custom postgresql.conf, mounted from ConfigMap.
+          # MUST use `args:` (not `command:`) so docker-entrypoint.sh stays in
+          # control — it handles first-boot initdb + creates the user/db from
+          # POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB env. Bypassing the
+          # entrypoint with `command:` leaves the data dir uninitialized and
+          # postgres crash-loops on first boot.
+          # `args` overrides CMD; first item must be `postgres` so the
+          # entrypoint's `if [ "$1" = 'postgres' ]` init branch fires.
+          args:
+            - postgres
+            - -c
+            - config_file=/etc/postgresql/postgresql.conf
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { configMapKeyRef: { name: tradetally-config, key: DB_USER } }
+            - name: POSTGRES_DB
+              valueFrom: { configMapKeyRef: { name: tradetally-config, key: DB_NAME } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: tradetally-secrets, key: DB_PASSWORD } }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, trader, -d, tradetally]
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: [pg_isready, -U, trader, -d, tradetally]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - pg_ctl
+                  - stop
+                  - -D
+                  - /var/lib/postgresql/data/pgdata
+                  - -m
+                  - fast
+      volumes:
+        - name: config
+          configMap:
+            name: tradetally-postgres-config
+            items:
+              - key: postgresql.conf
+                path: postgresql.conf
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 10Gi

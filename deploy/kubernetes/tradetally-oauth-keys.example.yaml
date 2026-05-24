@@ -1,0 +1,40 @@
+# Example template for the OAuth2/OIDC RSA signing keypair.
+#
+# DO NOT commit this file with real keys. The keypair signs JWTs for
+# the TradeTally mobile app's OAuth2 flow.
+#
+# Generate locally:
+#
+#   openssl genrsa -out /tmp/oauth-private.pem 2048
+#   openssl rsa -in /tmp/oauth-private.pem -pubout -out /tmp/oauth-public.pem
+#
+# Then create the Secret from the generated files (avoids YAML escaping
+# nightmares):
+#
+#   kubectl create secret generic tradetally-oauth-keys \
+#     -n tradetally \
+#     --from-file=oauth-private.pem=/tmp/oauth-private.pem \
+#     --from-file=oauth-public.pem=/tmp/oauth-public.pem \
+#     --dry-run=client -o yaml > tradetally-oauth-keys.yaml
+#
+#   # Optional: encrypt with SOPS before commit
+#   # sops --encrypt --in-place tradetally-oauth-keys.yaml
+#
+#   kubectl apply -f tradetally-oauth-keys.yaml
+#
+#   # Shred the temp PEMs:
+#   shred -u /tmp/oauth-private.pem /tmp/oauth-public.pem 2>/dev/null || \
+#     rm /tmp/oauth-private.pem /tmp/oauth-public.pem
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tradetally-oauth-keys
+  namespace: tradetally
+type: Opaque
+data:
+  # Each is the base64 encoding of a PEM file. The Deployment mounts these
+  # as subPath files at /app/backend/src/data/keys/oauth-{private,public}.pem
+  # (see app/deployment.yaml volumeMounts).
+  oauth-private.pem: <BASE64_OF_RSA_2048_PRIVATE_PEM>
+  oauth-public.pem: <BASE64_OF_RSA_2048_PUBLIC_PEM>

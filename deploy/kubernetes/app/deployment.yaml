@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tradetally-app
+  namespace: tradetally
+spec:
+  replicas: 1                              # single replica required — in-process schedulers
+  strategy:
+    type: Recreate                         # forced by RWO PVC; cost is brief downtime per upgrade
+  selector:
+    matchLabels:
+      app: tradetally-app
+  template:
+    metadata:
+      labels:
+        app: tradetally-app
+    spec:
+      terminationGracePeriodSeconds: 30
+      # No fsGroup — image's start.sh runs chown -R appuser:appgroup at runtime;
+      # kubelet fsGroup would chgrp the entire /uploads tree on every mount only
+      # to be overwritten by start.sh seconds later (wasted IO).
+      containers:
+        - name: tradetally
+          # Replace with your image. If you're running the upstream image,
+          # `potentialmidas/tradetally:v2.6.8` works as-is. If you've patched
+          # the source (e.g., from this fork's `homelab-patches` branch),
+          # rebuild + push to your own registry, e.g.:
+          #   docker buildx build --platform linux/amd64 \
+          #     -t your.registry.example.com/tradetally:v2.6.8-patched \
+          #     --push .
+          image: potentialmidas/tradetally:v2.6.8
+          ports:
+            - containerPort: 80
+              name: http
+          envFrom:
+            - configMapRef: { name: tradetally-config }
+            - secretRef:    { name: tradetally-secrets }
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/backend/uploads
+            - name: oauth-keys
+              mountPath: /app/backend/src/data/keys/oauth-private.pem
+              subPath: oauth-private.pem
+              readOnly: true
+            - name: oauth-keys
+              mountPath: /app/backend/src/data/keys/oauth-public.pem
+              subPath: oauth-public.pem
+              readOnly: true
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 1Gi }
+          # startupProbe gates readiness + liveness until 189 migrations + scheduler
+          # init complete and backend binds to :3000. See spec gotcha #1.
+          startupProbe:
+            httpGet: { path: /api/health, port: 80 }
+            periodSeconds: 10
+            failureThreshold: 60           # 10 min budget — generous for fresh DB
+          readinessProbe:
+            httpGet: { path: /api/health, port: 80 }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /api/health, port: 80 }
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: tradetally-uploads
+        - name: oauth-keys
+          secret:
+            secretName: tradetally-oauth-keys
+            defaultMode: 0444

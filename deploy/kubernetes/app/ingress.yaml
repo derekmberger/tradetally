@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tradetally
+  namespace: tradetally
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Match in-image nginx config: client_max_body_size 150M, proxy_read_timeout 600s
+    nginx.ingress.kubernetes.io/proxy-body-size: "150m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [tradetally.example.com]
+      secretName: tradetally-tls
+  rules:
+    - host: tradetally.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tradetally-app
+                port:
+                  number: 80

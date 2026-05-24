@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tradetally-app
+  namespace: tradetally
+spec:
+  type: ClusterIP
+  selector:
+    app: tradetally-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  # Note: image EXPOSEs both 80 and 3000, but only 80 is user-facing.
+  # nginx-in-image proxies /api → localhost:3000 internally.
